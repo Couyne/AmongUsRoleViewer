@@ -28,6 +28,11 @@ const il2cpp = {
     class_get_field:       fn("il2cpp_class_get_field_from_name", "pointer", ["pointer", "pointer"]),
     field_get_offset:      fn("il2cpp_field_get_offset", "uint32", ["pointer"]),
     field_static_get:      fn("il2cpp_field_static_get_value", "void", ["pointer", "pointer"]),
+    // FIX2: класс инстанцированного дженерика (List<T> с реальными оффсетами)
+    // можно взять только у живого объекта — у определения List`1 оффсеты = 0.
+    object_get_class:      fn("il2cpp_object_get_class", "pointer", ["pointer"]),
+    class_get_method:      fn("il2cpp_class_get_method_from_name", "pointer", ["pointer", "pointer", "int"]),
+    runtime_invoke:        fn("il2cpp_runtime_invoke", "pointer", ["pointer", "pointer", "pointer", "pointer"]),
 };
 
 function cstr(s) { return Memory.allocUtf8String(s); }
@@ -48,20 +53,6 @@ function findImage(name) {
     throw new Error("image not found: " + name);
 }
 
-// FIX: List<T> и Dictionary<K,V> живут в системной сборке (mscorlib /
-// System.Private.CoreLib), а не в Assembly-CSharp. Кешируем отдельно.
-let _mscorlibImg = null;
-function getMscorlibImage() {
-    if (_mscorlibImg) return _mscorlibImg;
-    try {
-        _mscorlibImg = findImage("mscorlib");
-    } catch (e) {
-        // на новых il2cpp-рантаймах (metadata v29+) сборка может называться иначе
-        _mscorlibImg = findImage("System.Private.CoreLib");
-    }
-    return _mscorlibImg;
-}
-
 function getClass(img, ns, name) {
     const c = il2cpp.class_from_name(img, cstr(ns), cstr(name));
     if (c.isNull()) throw new Error("class not found: " + name);
@@ -79,9 +70,30 @@ function fieldOffset(klass, field) {
 function fieldOffsetAny(klass, names) {
     for (const n of names) {
         const f = il2cpp.class_get_field(klass, cstr(n));
-        if (!f.isNull()) return il2cpp.field_get_offset(f);
+        if (!f.isNull()) {
+            const off = il2cpp.field_get_offset(f);
+            if (off !== 0) return off; // FIX2: у generic-ОПРЕДЕЛЕНИЯ оффсеты нулевые — пропускаем
+        }
     }
-    throw new Error("none of fields found: " + names.join(", "));
+    throw new Error("none of fields found (or zero offsets): " + names.join(", "));
+}
+
+// FIX2: оффсет поля у класса САМОГО объекта. Для дженериков (List<T>, Dictionary<K,V>)
+// это единственный надёжный способ: il2cpp_object_get_class возвращает
+// инстанцированный класс с настоящими оффсетами, а не generic-определение.
+function fieldOffsetOf(obj, names) {
+    return fieldOffsetAny(il2cpp.object_get_class(obj), Array.isArray(names) ? names : [names]);
+}
+
+// FIX2: вызов инстанс-метода без аргументов через il2cpp_runtime_invoke
+function invoke0(klass, methodName, obj) {
+    const m = il2cpp.class_get_method(klass, cstr(methodName), 0);
+    if (m.isNull()) throw new Error("method not found: " + methodName);
+    const exc = Memory.alloc(Process.pointerSize);
+    exc.writePointer(NULL);
+    const ret = il2cpp.runtime_invoke(m, obj, NULL, exc);
+    if (!exc.readPointer().isNull()) throw new Error("exception in " + methodName);
+    return ret;
 }
 
 // читаем C# string (System.String)
@@ -118,10 +130,11 @@ function main() {
     const list = gameData.add(offAllPlayers).readPointer();
     if (list.isNull()) { console.log("[!] AllPlayers пуст"); return; }
 
-    // FIX: List`1 ищем в mscorlib/System.Private.CoreLib, а не в Assembly-CSharp
-    const cList = getClass(getMscorlibImage(), "System.Collections.Generic", "List`1");
-    const offItems = fieldOffsetAny(cList, ["_items", "items"]);
-    const offSize  = fieldOffsetAny(cList, ["_size", "size"]);
+    // FIX2: оффсеты _items/_size берём у класса ЖИВОГО объекта списка.
+    // У generic-определения List`1 (даже из mscorlib) il2cpp отдаёт нулевые
+    // оффсеты — именно поэтому раньше size читался мусором.
+    const offItems = fieldOffsetOf(list, ["_items", "items"]);
+    const offSize  = fieldOffsetOf(list, ["_size", "size"]);
 
     const items = list.add(offItems).readPointer(); // Il2CppArray
     const size  = list.add(offSize).readS32();
@@ -153,9 +166,16 @@ function main() {
                 continue;
             }
 
-            // имя: Outfits[Default].PlayerName. Проще дернуть get_PlayerName, но обойдёмся без метода:
-            // берём первый Outfit из словаря. Надёжнее — вызвать метод, ниже fallback по dict.
-            let name = readPlayerName(pd, offOutfits, cOutfit);
+            // FIX2: имя берём вызовом настоящего геттера get_PlayerName() —
+            // надёжнее, чем ручной разбор Dictionary с угаданным stride.
+            let name;
+            try {
+                const s = invoke0(cNetInfo, "get_PlayerName", pd);
+                name = readCSharpString(s);
+                if (!name || name === "<null>") name = readPlayerName(pd, offOutfits, cOutfit); // fallback
+            } catch (err) {
+                name = readPlayerName(pd, offOutfits, cOutfit); // fallback на разбор словаря
+            }
 
             const roleName = ROLE_NAMES[roleType] !== undefined ? ROLE_NAMES[roleType] : ("Unknown(" + roleType + ")");
             console.log(`  #${playerId}  ${name}${isDead ? " (мёртв)" : ""}  ->  ${roleName}`);
@@ -171,11 +191,9 @@ function readPlayerName(pd, offOutfits, cOutfit) {
     try {
         const dict = pd.add(offOutfits).readPointer();
         if (dict.isNull()) return "<no outfit>";
-        // Dictionary: entries[] @ поле "entries", count @ "count". Берём первый валидный entry.value.PlayerName
-        // FIX: Dictionary`2 тоже в mscorlib/System.Private.CoreLib, а не в Assembly-CSharp
-        const cDict = getClass(getMscorlibImage(), "System.Collections.Generic", "Dictionary`2");
-        const offEntries = fieldOffsetAny(cDict, ["_entries", "entries"]);
-        const offCount   = fieldOffsetAny(cDict, ["_count", "count"]);
+        // FIX2: оффсеты берём у класса живого объекта словаря (см. комментарий у списка)
+        const offEntries = fieldOffsetOf(dict, ["_entries", "entries"]);
+        const offCount   = fieldOffsetOf(dict, ["_count", "count"]);
         const entries = dict.add(offEntries).readPointer();
         const count = dict.add(offCount).readS32();
         if (entries.isNull()) return "<no entries>";
