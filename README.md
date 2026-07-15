@@ -1,6 +1,6 @@
-# AmongUsRoleViewer
-
 # Among Us — Role Reader (external, Frida)
+
+![](images/photo_2026-07-15_21-33-26.jpg)
 
 Скрипт выводит роли всех игроков в текущей игре Among Us через Frida: читает `GameData.Instance.AllPlayers` и достаёт `RoleType` + имя у каждого игрока, ничего не компилируется, инъекция в процесс
 
