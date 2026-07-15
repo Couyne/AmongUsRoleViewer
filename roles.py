@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Windows: python roles.py            (attach к запущенной Among Us)
-#          python roles.py --spawn "C:\\...\\Among Us.exe"
+# Windows: python roles.py            (attach к запущенной игре)
 import sys, frida, os
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roles.js")
@@ -25,7 +24,7 @@ def main():
         pid = frida.spawn(sys.argv[2])
         session = frida.attach(pid)
     else:
-        # ищем процесс по подстроке "among us" (Proton/Wine даёт полный путь S:\...\Among Us.exe)
+        # ищем процесс по подстроке "among us"
         device = frida.get_local_device()
         target = None
         for p in device.enumerate_processes():
