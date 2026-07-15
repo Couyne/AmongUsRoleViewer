@@ -13,7 +13,7 @@
 ```cmd
 pip install -r requirements.txt
 ```
-Запуск
+## Запуск
 
 Запусти Among Us, зайди в лобби или матч (роли существуют, только когда `GameData.Instance` создан), затем:
 
