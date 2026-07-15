@@ -1,6 +1,4 @@
-// Among Us - вывод ролей игроков (external, frida, без il2cpp-bridge)
 // Резолвит классы/поля через экспорты GameAssembly.dll в рантайме.
-
 const MODULE = "GameAssembly.dll";
 
 const ROLE_NAMES = {
@@ -10,8 +8,6 @@ const ROLE_NAMES = {
     10: "Tracker", 12: "Detective", 18: "Viper",
 };
 
-// FIX: старый API Module.getExportByName убрали в новых версиях Frida (16.x).
-// Теперь нужно сначала получить модуль через Process.getModuleByName().
 function fn(name, ret, args) {
     const p = Process.getModuleByName(MODULE).getExportByName(name);
     return new NativeFunction(p, ret, args);
@@ -28,8 +24,7 @@ const il2cpp = {
     class_get_field:       fn("il2cpp_class_get_field_from_name", "pointer", ["pointer", "pointer"]),
     field_get_offset:      fn("il2cpp_field_get_offset", "uint32", ["pointer"]),
     field_static_get:      fn("il2cpp_field_static_get_value", "void", ["pointer", "pointer"]),
-    // FIX2: класс инстанцированного дженерика (List<T> с реальными оффсетами)
-    // можно взять только у живого объекта — у определения List`1 оффсеты = 0.
+    // можно взять только у живого объекта - у определения List`1 оффсеты = 0
     object_get_class:      fn("il2cpp_object_get_class", "pointer", ["pointer"]),
     class_get_method:      fn("il2cpp_class_get_method_from_name", "pointer", ["pointer", "pointer", "int"]),
     runtime_invoke:        fn("il2cpp_runtime_invoke", "pointer", ["pointer", "pointer", "pointer", "pointer"]),
@@ -37,7 +32,7 @@ const il2cpp = {
 
 function cstr(s) { return Memory.allocUtf8String(s); }
 
-// найти image по имени сборки (например "Assembly-CSharp" или "mscorlib")
+// найти image по имени сборки
 function findImage(name) {
     const domain = il2cpp.domain_get();
     il2cpp.thread_attach(domain);
@@ -65,27 +60,24 @@ function fieldOffset(klass, field) {
     return il2cpp.field_get_offset(f);
 }
 
-// Пробует несколько вариантов имени поля (разные версии mscorlib/.NET
 // называют внутренние поля Dictionary/List по-разному: "entries" vs "_entries").
 function fieldOffsetAny(klass, names) {
     for (const n of names) {
         const f = il2cpp.class_get_field(klass, cstr(n));
         if (!f.isNull()) {
             const off = il2cpp.field_get_offset(f);
-            if (off !== 0) return off; // FIX2: у generic-ОПРЕДЕЛЕНИЯ оффсеты нулевые — пропускаем
+            if (off !== 0) return off; // у generic-определения оффсеты - НУЛЕВЫЕ
         }
     }
     throw new Error("none of fields found (or zero offsets): " + names.join(", "));
 }
 
-// FIX2: оффсет поля у класса САМОГО объекта. Для дженериков (List<T>, Dictionary<K,V>)
 // это единственный надёжный способ: il2cpp_object_get_class возвращает
-// инстанцированный класс с настоящими оффсетами, а не generic-определение.
+// инстанцированный класс с настоящими оффсетами, а не generic-определение
 function fieldOffsetOf(obj, names) {
     return fieldOffsetAny(il2cpp.object_get_class(obj), Array.isArray(names) ? names : [names]);
 }
 
-// FIX2: вызов инстанс-метода без аргументов через il2cpp_runtime_invoke
 function invoke0(klass, methodName, obj) {
     const m = il2cpp.class_get_method(klass, cstr(methodName), 0);
     if (m.isNull()) throw new Error("method not found: " + methodName);
@@ -96,7 +88,7 @@ function invoke0(klass, methodName, obj) {
     return ret;
 }
 
-// читаем C# string (System.String)
+// читаем C# string
 function readCSharpString(ptr) {
     if (ptr.isNull()) return "<null>";
     const len = ptr.add(is64 ? 0x10 : 0x8).readS32();
@@ -130,9 +122,7 @@ function main() {
     const list = gameData.add(offAllPlayers).readPointer();
     if (list.isNull()) { console.log("[!] AllPlayers пуст"); return; }
 
-    // FIX2: оффсеты _items/_size берём у класса ЖИВОГО объекта списка.
-    // У generic-определения List`1 (даже из mscorlib) il2cpp отдаёт нулевые
-    // оффсеты — именно поэтому раньше size читался мусором.
+    // у generic-определения List`1 (даже из mscorlib) il2cpp отдаёт нулевые
     const offItems = fieldOffsetOf(list, ["_items", "items"]);
     const offSize  = fieldOffsetOf(list, ["_size", "size"]);
 
@@ -140,15 +130,15 @@ function main() {
     const size  = list.add(offSize).readS32();
     const arrDataOff = is64 ? 0x20 : 0x10; // начало данных Il2CppArray
 
-    // Защита от мусорного значения size (если офсеты по какой-то причине не сошлись,
-    // не пытаемся читать миллионы элементов и не крашимся сразу).
+    // защита от мусорного size (если оффсеты по какой-то причине не сошлись)
+    // не пытаемся читать миллионы элементов
     if (size < 0 || size > 64) {
         console.log(`[!] Подозрительный размер списка AllPlayers: ${size}. Возможно, офсеты не совпадают с этой версией игры.`);
         console.log(`    list=${list} items=${items} offItems=${offItems} offSize=${offSize}`);
         return;
     }
 
-    console.log("\n===== РОЛИ ИГРОКОВ =====");
+    console.log("\n-----ROLES-----");
     for (let i = 0; i < size; i++) {
         try {
             const pd = items.add(arrDataOff + i * Process.pointerSize).readPointer();
@@ -158,16 +148,13 @@ function main() {
             const roleType = pd.add(offRoleType).readU16();
             const isDead   = pd.add(offIsDead).readU8() !== 0;
 
-            // Sanity-check: валидный playerId в Among Us — 0..14 (максимум игроков).
-            // Если больше — значит указатель pd битый (неверные офсеты/структура),
-            // и дальше в память лезть не стоит, чтобы не поймать access violation.
+            // если больше - значит указатель pd битый
+            // и дальше в память лезть не стоит, чтобы не поймать access violation
             if (playerId > 20) {
                 console.log(`  [пропущен] i=${i} pd=${pd} даёт мусор (playerId=${playerId}, roleType=${roleType}) — офсеты не сошлись`);
                 continue;
             }
 
-            // FIX2: имя берём вызовом настоящего геттера get_PlayerName() —
-            // надёжнее, чем ручной разбор Dictionary с угаданным stride.
             let name;
             try {
                 const s = invoke0(cNetInfo, "get_PlayerName", pd);
@@ -191,7 +178,6 @@ function readPlayerName(pd, offOutfits, cOutfit) {
     try {
         const dict = pd.add(offOutfits).readPointer();
         if (dict.isNull()) return "<no outfit>";
-        // FIX2: оффсеты берём у класса живого объекта словаря (см. комментарий у списка)
         const offEntries = fieldOffsetOf(dict, ["_entries", "entries"]);
         const offCount   = fieldOffsetOf(dict, ["_count", "count"]);
         const entries = dict.add(offEntries).readPointer();
@@ -200,10 +186,8 @@ function readPlayerName(pd, offOutfits, cOutfit) {
         if (count < 0 || count > 32) return `<bad count:${count}>`;
 
         const offName = fieldOffset(cOutfit, "PlayerName");
-        // Entry<TKey,TValue>: struct {hashCode:int, next:int, key:TKey, value:TValue}
-        // value (PlayerOutfit ref) лежит в конце. Размер entry вычислим грубо: пройдёмся и найдём непустое имя.
         const arrDataOff = is64 ? 0x20 : 0x10;
-        // Определим stride entry: (key=enum int + value=ptr + hashCode+next). Обычно на 32-бит = 0x10.
+        // Определим stride entry: (key=enum int + value=ptr + hashCode+next) Обычно на 32-бит = 0x10
         const stride = is64 ? 0x18 : 0x10;
         for (let e = 0; e < count; e++) {
             const entryBase = entries.add(arrDataOff + e * stride);
@@ -223,5 +207,5 @@ function readPlayerName(pd, offOutfits, cOutfit) {
 try {
     main();
 } catch (e) {
-    console.log("[ОШИБКА] " + e.message + "\n" + e.stack);
+    console.log("[ERROR] " + e.message + "\n" + e.stack);
 }
