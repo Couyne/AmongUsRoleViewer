@@ -33,9 +33,10 @@ def main():
                 target = p
                 break
         if target is None:
-            print("[!] Процесс Among Us не найден. Запусти игру или используй --spawn.")
+            print("[!] Процесс игры не найден")
             return
-        print(f"[+] Найден: {target.name} (pid {target.pid})")
+        print(f"[+] Найден: {target.name} - pid {target.pid}")
+        print(f"https://github.com/Couyne/AmongUsRoleViewer")
         session = frida.attach(target.pid)
 
     script = session.create_script(code)
